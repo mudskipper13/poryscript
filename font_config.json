@@ -173,6 +173,9 @@
         "{MAXIE}": 30,
         "{KYOGRE}": 36,
         "{GROUDON}": 42,
+        "{SPEAKER}": 0,
+        "{NAME_PLAYER}": 0,
+        "{NAME_MOM}": 0,
         "$": 0
       }
     },
@@ -341,6 +344,9 @@
         "{KUN}": 0,
         "{RIVAL}": 56,
         "{VERSION}": 56,
+        "{SPEAKER}": 0,
+        "{NAME_PLAYER}": 0,
+        "{NAME_MOM}": 0,
         "$": 0
       }
     }
