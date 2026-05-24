@@ -65,51 +65,54 @@ type AutoVarCommand struct {
 
 // Parser is a Poryscript AST parser.
 type Parser struct {
-	l                       *lexer.Lexer
-	curToken                token.Token
-	peekToken               token.Token
-	peek2Token              token.Token
-	peek3Token              token.Token
-	peek4Token              token.Token
-	implicitData            impData
-	inlineTexts             []ast.Text
-	inlineTextsSet          map[textKey]string
-	inlineTextCounts        map[string]int
-	inlineMovements         []*ast.MovementStatement
-	inlineMovementsSet      map[string]string
-	inlineMovementCounts    map[string]int
-	textStatements          []*ast.TextStatement
-	breakStack              []ast.Statement
-	continueStack           []ast.Statement
-	commandConfig           CommandConfig
-	fontConfigFilepath      string
-	defaultFontID           string
-	fonts                   *FontConfig
-	maxLineLength           int
-	compileSwitches         map[string]string
-	constants               map[string]string
-	enableEnvironmentErrors bool
+	l                        *lexer.Lexer
+	curToken                 token.Token
+	peekToken                token.Token
+	peek2Token               token.Token
+	peek3Token               token.Token
+	peek4Token               token.Token
+	implicitData             impData
+	inlineTexts              []ast.Text
+	inlineTextsSet           map[textKey]string
+	inlineTextCounts         map[string]int
+	inlineMovements          []*ast.MovementStatement
+	inlineMovementsSet       map[string]string
+	inlineMovementCounts     map[string]int
+	textStatements           []*ast.TextStatement
+	breakStack               []ast.Statement
+	continueStack            []ast.Statement
+	commandConfig            CommandConfig
+	fontConfigFilepath       string
+	defaultFontID            string
+	fonts                    *FontConfig
+	maxLineLength            int
+	compileSwitches          map[string]string
+	constants                map[string]string
+	enableEnvironmentErrors  bool
+	enableDiagnosticWarnings bool
+	warnings                 []ast.Warning
 }
 
 // New creates a new Poryscript AST Parser.
 func New(l *lexer.Lexer, commandConfig CommandConfig, fontConfigFilepath, defaultFontID string, maxLineLength int, compileSwitches map[string]string) *Parser {
 	p := &Parser{
-		l:                       l,
-		implicitData:            impData{},
-		inlineTexts:             make([]ast.Text, 0),
-		inlineTextsSet:          make(map[textKey]string),
-		inlineTextCounts:        make(map[string]int),
-		inlineMovements:         make([]*ast.MovementStatement, 0),
-		inlineMovementsSet:      make(map[string]string),
-		inlineMovementCounts:    make(map[string]int),
-		textStatements:          make([]*ast.TextStatement, 0),
-		commandConfig:           commandConfig,
-		fontConfigFilepath:      fontConfigFilepath,
-		defaultFontID:           defaultFontID,
-		maxLineLength:           maxLineLength,
-		compileSwitches:         compileSwitches,
-		constants:               make(map[string]string),
-		enableEnvironmentErrors: true,
+		l:                        l,
+		implicitData:             impData{},
+		inlineTexts:              make([]ast.Text, 0),
+		inlineTextsSet:           make(map[textKey]string),
+		inlineTextCounts:         make(map[string]int),
+		inlineMovements:          make([]*ast.MovementStatement, 0),
+		inlineMovementsSet:       make(map[string]string),
+		inlineMovementCounts:     make(map[string]int),
+		textStatements:           make([]*ast.TextStatement, 0),
+		commandConfig:            commandConfig,
+		fontConfigFilepath:       fontConfigFilepath,
+		defaultFontID:            defaultFontID,
+		maxLineLength:            maxLineLength,
+		compileSwitches:          compileSwitches,
+		constants:                make(map[string]string),
+		enableEnvironmentErrors:  true,
+		enableDiagnosticWarnings: false,
 	}
 	// Read five tokens, so curToken, peekToken, peek2Token, peek3Token, and peek4Token are all set.
 	p.nextToken()
@@ -120,11 +123,81 @@ func New(l *lexer.Lexer, commandConfig CommandConfig, fontConfigFilepath, defaul
 	return p
 }
 
-// New creates a new Poryscript AST Parser.
-func NewLintParser(l *lexer.Lexer, commandConfig CommandConfig) *Parser {
-	p := New(l, commandConfig, "", "", 0, nil)
+// NewLintParser creates a new Poryscript AST Parser for linting purposes.
+func NewLintParser(l *lexer.Lexer, commandConfig CommandConfig, fontConfigFilepath, defaultFontID string, maxLineLength int) *Parser {
+	p := New(l, commandConfig, fontConfigFilepath, defaultFontID, maxLineLength, nil)
 	p.enableEnvironmentErrors = false
+	p.enableDiagnosticWarnings = true
 	return p
+}
+
+func (p *Parser) validateTextLineWidth(tok token.Token, text string) {
+	if !p.enableDiagnosticWarnings || p.fontConfigFilepath == "" {
+		return
+	}
+	if p.fonts == nil {
+		fc, err := LoadFontConfig(p.fontConfigFilepath)
+		if err != nil {
+			return
+		}
+		p.fonts = &fc
+	}
+
+	fontID := p.defaultFontID
+	if fontID == "" {
+		fontID = p.fonts.DefaultFontID
+	}
+
+	maxWidth := p.maxLineLength
+	if maxWidth <= 0 {
+		maxWidth = p.fonts.Fonts[fontID].MaxLineLength
+	}
+
+	cursorOverlapWidth := p.fonts.Fonts[fontID].CursorOverlapWidth
+	lineErrors := p.fonts.ValidateLineWidths(text, fontID, maxWidth, cursorOverlapWidth)
+	for _, le := range lineErrors {
+		// Resolve the source position for this logical line.
+		lineNumber := tok.LineNumber
+		charStart := tok.StartCharIndex
+		utf8CharStart := tok.StartUtf8CharIndex
+		charEnd := tok.EndCharIndex
+		utf8CharEnd := tok.EndUtf8CharIndex
+		if le.LineIndex < len(tok.OriginalLines) {
+			src := tok.OriginalLines[le.LineIndex]
+			lineNumber = src.Line
+			charStart = src.StartChar + le.CharOffset
+			utf8CharStart = src.StartUtf8Char + le.Utf8CharOffset
+			charEnd = src.StartChar + le.CharOffset + le.CharLength
+			utf8CharEnd = src.StartUtf8Char + le.Utf8CharOffset + le.Utf8CharLength
+		}
+		p.warnings = append(p.warnings, ast.Warning{
+			Type:            ast.WarningLineTooLong,
+			LineNumberStart: lineNumber,
+			LineNumberEnd:   lineNumber,
+			CharStart:       charStart,
+			Utf8CharStart:   utf8CharStart,
+			CharEnd:         charEnd,
+			Utf8CharEnd:     utf8CharEnd,
+			Message:         fmt.Sprintf("line of text exceeds maximum width (%d > %d pixels): \"%s\"", le.PixelWidth, le.MaxWidth, le.LineText),
+		})
+	}
+}
+
+// applyTextReplacements applies any configured text substitution rules from
+// the font config to the given string. Returns the string unchanged if no
+// font config is available.
+func (p *Parser) applyTextReplacements(text string) string {
+	if p.fontConfigFilepath == "" {
+		return text
+	}
+	if p.fonts == nil {
+		fc, err := LoadFontConfig(p.fontConfigFilepath)
+		if err != nil {
+			return text
+		}
+		p.fonts = &fc
+	}
+	return p.fonts.ApplyTextReplacements(text)
 }
 
 func (p *Parser) pushBreakStack(statement ast.Statement) {
@@ -296,6 +369,7 @@ func (p *Parser) ParseProgram() (*ast.Program, error) {
 		}
 	}
 
+	program.Warnings = p.warnings
 	return program, nil
 }
 
@@ -602,9 +676,11 @@ func (p *Parser) parseCommandStatement(scriptName string) (*ast.CommandStatement
 					scriptName: scriptName,
 				})
 				argParts = append(argParts, "")
-			} else if p.curToken.Type == token.STRING {
+			} else if token.IsStringLikeToken(p.curToken.Type) {
+				literal := p.applyTextReplacements(p.curToken.Literal)
+				p.validateTextLineWidth(p.curToken, literal)
 				strToken := p.curToken
-				strToken.Literal = p.formatTextTerminator(p.curToken.Literal, "")
+				strToken.Literal = p.formatTextTerminator(literal, "")
 				impData.texts = append(impData.texts, impText{
 					command:    command,
 					argPos:     len(command.Args),
@@ -615,11 +691,13 @@ func (p *Parser) parseCommandStatement(scriptName string) (*ast.CommandStatement
 			} else if p.curToken.Type == token.STRINGTYPE {
 				stringType := p.curToken.Literal
 				p.nextToken()
-				if p.curToken.Type != token.STRING {
+				if !token.IsStringLikeToken(p.curToken.Type) {
 					return nil, nil, NewParseError(p.curToken, fmt.Sprintf("expected a string literal after string type '%s'. Got '%s' instead", stringType, p.curToken.Literal))
 				}
+				literal := p.applyTextReplacements(p.curToken.Literal)
+				p.validateTextLineWidth(p.curToken, literal)
 				strToken := p.curToken
-				strToken.Literal = p.formatTextTerminator(p.curToken.Literal, stringType)
+				strToken.Literal = p.formatTextTerminator(literal, stringType)
 				impData.texts = append(impData.texts, impText{
 					command:    command,
 					argPos:     len(command.Args),
@@ -757,15 +835,19 @@ func (p *Parser) parseTextValue() (string, string, error) {
 			return "", "", err
 		}
 		return p.formatTextTerminator(strValue, stringType), stringType, nil
-	} else if p.curToken.Type == token.STRING {
-		return p.formatTextTerminator(p.curToken.Literal, ""), "", nil
+	} else if token.IsStringLikeToken(p.curToken.Type) {
+		literal := p.applyTextReplacements(p.curToken.Literal)
+		p.validateTextLineWidth(p.curToken, literal)
+		return p.formatTextTerminator(literal, ""), "", nil
 	} else if p.curToken.Type == token.STRINGTYPE {
 		stringType := p.curToken.Literal
 		p.nextToken()
-		if p.curToken.Type != token.STRING {
+		if !token.IsStringLikeToken(p.curToken.Type) {
 			return "", "", NewParseError(p.curToken, fmt.Sprintf("expected a string literal after string type '%s'. Got '%s' instead", stringType, p.curToken.Literal))
 		}
-		return p.formatTextTerminator(p.curToken.Literal, stringType), stringType, nil
+		literal := p.applyTextReplacements(p.curToken.Literal)
+		p.validateTextLineWidth(p.curToken, literal)
+		return p.formatTextTerminator(literal, stringType), stringType, nil
 	} else {
 		return "", "", NewParseError(p.curToken, fmt.Sprintf("body of text statement must be a string or formatted string. Got '%s' instead", p.curToken.Literal))
 	}
@@ -1241,10 +1323,14 @@ func (p *Parser) parseFormatStringOperator() (token.Token, string, string, error
 		p.nextToken()
 		stringType = p.curToken.Literal
 	}
+	if p.peekToken.Type == token.AUTOSTRING {
+		return token.Token{}, "", "", NewParseError(p.peekToken, "auto strings cannot be used with format()")
+	}
 	if err := p.expectPeek(token.STRING); err != nil {
 		return token.Token{}, "", "", NewParseError(p.peekToken, fmt.Sprintf("invalid format() argument '%s'. Expected a string literal", p.peekToken.Literal))
 	}
 	textToken := p.curToken
+	textToken.Literal = p.applyTextReplacements(textToken.Literal)
 	var fontID string
 	var fontIdToken token.Token
 	if p.fonts == nil {

@@ -8,11 +8,28 @@ import (
 	"strings"
 )
 
+// TextReplacement defines a single text substitution rule that is applied to
+// all string literals during parsing.
+type TextReplacement struct {
+	Pattern     string `json:"pattern"`
+	Replacement string `json:"replacement"`
+	IsRegex     bool   `json:"regex"`
+}
+
+// compiledTextReplacement holds the pre-processed form of a TextReplacement.
+type compiledTextReplacement struct {
+	literal     string
+	regex       *regexp.Regexp
+	replacement string
+}
+
 // FontConfig holds the configuration for various supported fonts, as well as
 // the default font.
 type FontConfig struct {
-	DefaultFontID string           `json:"defaultFontId"`
-	Fonts         map[string]Fonts `json:"fonts"`
+	DefaultFontID    string            `json:"defaultFontId"`
+	Fonts            map[string]Fonts  `json:"fonts"`
+	TextReplacements []TextReplacement `json:"textReplacements"`
+	compiled         []compiledTextReplacement
 }
 
 type Fonts struct {
@@ -34,7 +51,227 @@ func LoadFontConfig(filepath string) (FontConfig, error) {
 		return config, err
 	}
 
+	if err := config.compileReplacements(); err != nil {
+		return config, err
+	}
+
 	return config, err
+}
+
+// compileReplacements pre-compiles text replacement rules. Literal patterns
+// are stored as-is; regex patterns are compiled into *regexp.Regexp.
+func (fc *FontConfig) compileReplacements() error {
+	fc.compiled = make([]compiledTextReplacement, len(fc.TextReplacements))
+	for i, tr := range fc.TextReplacements {
+		fc.compiled[i].replacement = tr.Replacement
+		if tr.IsRegex {
+			re, err := regexp.Compile(tr.Pattern)
+			if err != nil {
+				return fmt.Errorf("invalid regex pattern in font config's textReplacements[%d]: %s", i, err)
+			}
+			fc.compiled[i].regex = re
+		} else {
+			fc.compiled[i].literal = tr.Pattern
+		}
+	}
+	return nil
+}
+
+// ApplyTextReplacements applies all configured text substitution rules to the
+// given string, in the order they are defined in the configuration.
+func (fc *FontConfig) ApplyTextReplacements(text string) string {
+	for _, cr := range fc.compiled {
+		if cr.regex != nil {
+			text = cr.regex.ReplaceAllString(text, cr.replacement)
+		} else {
+			text = strings.ReplaceAll(text, cr.literal, cr.replacement)
+		}
+	}
+	return text
+}
+
+// LineTooLongError describes a single line that exceeds the maximum pixel width.
+type LineTooLongError struct {
+	LineIndex      int
+	LineText       string
+	PixelWidth     int
+	MaxWidth       int
+	CharOffset     int
+	Utf8CharOffset int
+	CharLength     int
+	Utf8CharLength int
+}
+
+// ValidateLineWidths checks each line of text against maxWidth and returns
+// a list of lines that exceed the limit. Logical lines are delimited by
+// real newline characters (inserted by the lexer for AUTOSTRINGs).
+// Within each logical line, manual line-break escape sequences (\n, \l,
+// \p) further subdivide the text; each sub-segment is validated
+// independently but reported under the parent logical line's index.
+//
+// When cursorOverlapWidth > 0, the effective maximum width is reduced
+// by cursorOverlapWidth for segments followed by \l or \p escapes,
+// since the game renders a cursor before those breaks.
+//
+// Unlike FormatText (which collapses spaces during word-wrapping), this
+// function counts every space character toward the pixel width, since the
+// text is rendered as-is in the game.
+func (fc *FontConfig) ValidateLineWidths(text, fontID string, maxWidth, cursorOverlapWidth int) []LineTooLongError {
+	if maxWidth <= 0 {
+		return nil
+	}
+
+	maxWidthWithCursor := maxWidth - cursorOverlapWidth
+
+	// Split on real newlines to get logical lines. For AUTOSTRINGs the
+	// lexer inserts a real newline after each escape sequence, e.g.
+	// "Line one\n\nLine two\l\n" splits into ["Line one\n", "Line two\l", ""].
+	lines := strings.Split(text, "\n")
+
+	var errors []LineTooLongError
+	for i, line := range lines {
+		// Split on any remaining manual line-break escapes and validate
+		// each sub-segment independently.
+		segments := splitOnLineBreakEscapes(line)
+		for _, seg := range segments {
+			effectiveMaxWidth := maxWidth
+			if seg.trailingEscape == 'l' || seg.trailingEscape == 'p' {
+				effectiveMaxWidth = maxWidthWithCursor
+			}
+			width := fc.computeLinePixelWidth(seg.text, fontID)
+			if width > effectiveMaxWidth && len(seg.text) > 0 {
+				errors = append(errors, LineTooLongError{
+					LineIndex:      i,
+					LineText:       seg.text,
+					PixelWidth:     width,
+					MaxWidth:       effectiveMaxWidth,
+					CharOffset:     seg.byteOffset,
+					Utf8CharOffset: seg.runeOffset,
+					CharLength:     len(seg.text),
+					Utf8CharLength: seg.runeLength,
+				})
+			}
+		}
+	}
+
+	return errors
+}
+
+func stripTrailingLineBreak(line string) string {
+	if len(line) >= 2 {
+		tail := line[len(line)-2:]
+		if tail == `\n` || tail == `\l` || tail == `\p` {
+			return line[:len(line)-2]
+		}
+	}
+	return line
+}
+
+type lineSegment struct {
+	text           string
+	byteOffset     int
+	runeOffset     int
+	runeLength     int
+	trailingEscape rune
+}
+
+// splitOnLineBreakEscapes splits text on manual line-break escape sequences
+// (\n, \l, \p) that appear outside of control codes ({...}).
+// Returns the sub-segments between the breaks with their offsets.
+func splitOnLineBreakEscapes(text string) []lineSegment {
+	var segments []lineSegment
+	controlCodeLevel := 0
+	escape := false
+	segStartByte := 0
+	segStartRune := 0
+	runeIndex := 0
+	for i, ch := range text {
+		if escape {
+			if controlCodeLevel == 0 && (ch == 'n' || ch == 'l' || ch == 'p') {
+				// The escape started at i - 1 (the backslash byte).
+				seg := text[segStartByte : i-1]
+				segments = append(segments, lineSegment{
+					text:           stripTrailingLineBreak(seg),
+					byteOffset:     segStartByte,
+					runeOffset:     segStartRune,
+					runeLength:     runeIndex - 1 - segStartRune, // exclude backslash
+					trailingEscape: ch,
+				})
+				segStartByte = i + 1
+				segStartRune = runeIndex + 1
+			}
+			escape = false
+			runeIndex++
+			continue
+		}
+		if ch == '\\' && controlCodeLevel == 0 {
+			escape = true
+			runeIndex++
+			continue
+		}
+		if ch == '{' {
+			controlCodeLevel++
+		} else if ch == '}' && controlCodeLevel > 0 {
+			controlCodeLevel--
+		}
+		runeIndex++
+	}
+	// Append the final segment.
+	seg := text[segStartByte:]
+	segments = append(segments, lineSegment{
+		text:       seg,
+		byteOffset: segStartByte,
+		runeOffset: segStartRune,
+		runeLength: runeIndex - segStartRune,
+	})
+	return segments
+}
+
+// computeLinePixelWidth computes the pixel width of a single line of text,
+// counting every character (including spaces) individually.
+func (fc *FontConfig) computeLinePixelWidth(line, fontID string) int {
+	width := 0
+	controlCodeLevel := 0
+	var controlCodeSb strings.Builder
+	escape := false
+
+	for _, ch := range line {
+		if escape {
+			// Non-line-break escape (line breaks already stripped/skipped).
+			width += fc.getRunePixelWidth('\\', fontID)
+			width += fc.getRunePixelWidth(ch, fontID)
+			escape = false
+			continue
+		}
+
+		if ch == '\\' && controlCodeLevel == 0 {
+			escape = true
+			continue
+		}
+
+		if ch == '{' {
+			controlCodeLevel++
+			controlCodeSb.WriteRune(ch)
+			continue
+		}
+		if ch == '}' && controlCodeLevel > 0 {
+			controlCodeSb.WriteRune(ch)
+			controlCodeLevel--
+			if controlCodeLevel == 0 {
+				width += fc.getControlCodePixelWidth(controlCodeSb.String(), fontID)
+				controlCodeSb.Reset()
+			}
+			continue
+		}
+		if controlCodeLevel > 0 {
+			controlCodeSb.WriteRune(ch)
+			continue
+		}
+
+		width += fc.getRunePixelWidth(ch, fontID)
+	}
+
+	return width
 }
 
 const testFontID = "TEST"

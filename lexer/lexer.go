@@ -301,11 +301,15 @@ func (l *Lexer) NextToken() token.Token {
 
 func (l *Lexer) readStringToken() token.Token {
 	var t token.Token
+	var isAutoString bool
 	t.StartCharIndex = l.prevCharNumber
 	t.StartUtf8CharIndex = l.prevUtf8CharNumber
 	t.LineNumber = l.lineNumber
-	t.Literal, t.EndLineNumber, t.EndCharIndex, t.EndUtf8CharIndex = l.readString()
+	t.Literal, t.EndLineNumber, t.EndCharIndex, t.EndUtf8CharIndex, isAutoString, t.OriginalLines = l.readString()
 	t.Type = token.STRING
+	if isAutoString {
+		t.Type = token.AUTOSTRING
+	}
 	return t
 }
 
@@ -352,29 +356,110 @@ func (l *Lexer) readIdentifier() string {
 	return l.input[start:l.position]
 }
 
-func (l *Lexer) readString() (string, int, int, int) {
+func (l *Lexer) readString() (string, int, int, int, bool, []token.SourceLinePosition) {
 	var sb strings.Builder
 	var endLine, endChar, endUtf8Char int
+	var linePositions []token.SourceLinePosition
+
+	// Track state for auto-formatting multi-line strings
+	isAutoString := false
+	newParagraph := true
+
+	// Per-line position tracking
+	var curLineNum int
+	var curStartChar, curStartUtf8Char int
+	var curEndChar, curEndUtf8Char int
+
 	for l.ch == '"' {
 		if sb.Len() > 0 {
 			sb.WriteString("\n")
 		}
+		// Record start of this logical line.
+		curLineNum = l.lineNumber
 		l.readChar()
+		curStartChar = l.prevCharNumber
+		curStartUtf8Char = l.prevUtf8CharNumber
+		curEndChar = curStartChar
+		curEndUtf8Char = curStartUtf8Char
+
 		for l.ch != '"' && l.ch != 0 {
-			if l.skipNewlineWhitespace() {
-				l.skipWhitespace()
-				sb.WriteRune(' ')
+			if l.ch == '\n' || l.ch == '\r' {
+				linePositions = append(linePositions, token.SourceLinePosition{
+					Line:          curLineNum,
+					StartChar:     curStartChar,
+					StartUtf8Char: curStartUtf8Char,
+					EndChar:       curEndChar,
+					EndUtf8Char:   curEndUtf8Char,
+				})
+
+				// Multi-line string: auto-format with \n, \l, \p
+				// Count newlines to detect paragraph breaks
+				// A blank line (whitespace-only line) counts as a paragraph break
+				newlineCount := 0
+				for {
+					for l.ch == '\n' || l.ch == '\r' {
+						if l.ch == '\n' {
+							newlineCount++
+						}
+						l.readChar()
+					}
+					// Skip whitespace (indentation)
+					for l.ch == ' ' || l.ch == '\t' {
+						l.readChar()
+					}
+					// If we hit another newline after whitespace, continue counting
+					// (this handles blank lines with only whitespace)
+					if l.ch == '\n' || l.ch == '\r' {
+						continue
+					}
+					break
+				}
+
+				if l.ch == '"' || l.ch == 0 {
+					break
+				}
+
+				// Determine what escape sequence to insert
+				isAutoString = true
+				if newlineCount >= 2 {
+					sb.WriteString("\\p\n")
+					newParagraph = true
+				} else if newParagraph {
+					sb.WriteString("\\n\n")
+					newParagraph = false
+				} else {
+					sb.WriteString("\\l\n")
+				}
+
+				// Record start of new logical line.
+				curLineNum = l.lineNumber
+				curStartChar = l.prevCharNumber
+				curStartUtf8Char = l.prevUtf8CharNumber
+				curEndChar = curStartChar
+				curEndUtf8Char = curStartUtf8Char
+				continue
 			}
 			sb.WriteRune(l.ch)
+			curEndChar = l.charNumber
+			curEndUtf8Char = l.utf8CharNumber
 			l.readChar()
 		}
+
+		linePositions = append(linePositions, token.SourceLinePosition{
+			Line:          curLineNum,
+			StartChar:     curStartChar,
+			StartUtf8Char: curStartUtf8Char,
+			EndChar:       curEndChar,
+			EndUtf8Char:   curEndUtf8Char,
+		})
+
 		l.readChar()
 		endLine = l.lineNumber
 		endChar = l.prevCharNumber
 		endUtf8Char = l.prevUtf8CharNumber
 		l.skipWhitespace()
 	}
-	return sb.String(), endLine, endChar, endUtf8Char
+	return sb.String(), endLine, endChar, endUtf8Char, isAutoString, linePositions
 }
 
 func (l *Lexer) readRaw() string {

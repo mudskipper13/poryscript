@@ -3,6 +3,16 @@ package token
 // Type distinguishes between different types of tokens in the Poryscript lexer.
 type Type string
 
+// SourceLinePosition records the source location of a single logical line
+// within a multi-line or AUTOSTRING literal.
+type SourceLinePosition struct {
+	Line          int
+	StartChar     int
+	StartUtf8Char int
+	EndChar       int
+	EndUtf8Char   int
+}
+
 // Token represents a single token in the Poryscript lexer.
 type Token struct {
 	Type               Type
@@ -13,6 +23,10 @@ type Token struct {
 	EndLineNumber      int
 	EndCharIndex       int
 	EndUtf8CharIndex   int
+	// OriginalLines maps each logical line index in a string literal back
+	// to its source position. Populated for AUTOSTRING and multi-segment
+	// string tokens.
+	OriginalLines []SourceLinePosition
 }
 
 // Token types
@@ -24,6 +38,7 @@ const (
 	IDENT      = "IDENT"
 	INT        = "INT"
 	STRING     = "STRING"
+	AUTOSTRING = "AUTOSTRING"
 	RAWSTRING  = "RAWSTRING"
 	STRINGTYPE = "STRINGTYPE"
 
@@ -127,4 +142,11 @@ func GetIdentType(ident string) Type {
 		return tokType
 	}
 	return IDENT
+}
+
+// IsStringLikeToken checks if the given token is string-like.
+// There are situations where the parser doesn't care if it's dealing
+// with an AUTOSTRING vs. a regular STRING--so this if for convenience.
+func IsStringLikeToken(tokenType Type) bool {
+	return tokenType == STRING || tokenType == AUTOSTRING
 }
